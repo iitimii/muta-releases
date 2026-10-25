@@ -1,0 +1,104 @@
+# Copy one desktop release from the private nelsonifechukwu/Muta repository into this public one,
+# entirely inside GitHub's network: nothing is downloaded to anyone's computer.
+#
+# Started by `make release-mirror TAG=vX.Y.Z` in the Muta repository. That command stores a token
+# that can read nelsonifechukwu/Muta as the MUTA_SOURCE_TOKEN secret for the duration of the run
+# and deletes it afterwards. Writing to this repository uses the run's own token.
+#
+# Each package is checked against its .sha256 before upload. The release stays a draft until
+# every asset is uploaded and every name and size matches the source, so visitors never see a
+# partial release. Re-running resumes: assets already uploaded are skipped.
+name: mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag in nelsonifechukwu/Muta, for example v0.1.450
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SOURCE_REPO: nelsonifechukwu/Muta
+      TAG: ${{ inputs.tag }}
+      SOURCE_TOKEN: ${{ secrets.MUTA_SOURCE_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check inputs
+        run: |
+          if [[ -z "$SOURCE_TOKEN" ]]; then
+            echo "::error::MUTA_SOURCE_TOKEN is not set. Start this with 'make release-mirror TAG=...' in the Muta repository."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::The tag input must look like v0.1.450."
+            exit 1
+          fi
+
+      - name: Copy, verify and publish
+        run: |
+          set -euo pipefail
+          source_gh() { GH_TOKEN="$SOURCE_TOKEN" gh "$@"; }
+          work="$RUNNER_TEMP/release"
+          mkdir -p "$work"
+          cd "$work"
+
+          listing='.assets[] | "\(.name)\t\(.size)"'
+          source_gh release view "$TAG" -R "$SOURCE_REPO" --json name,body > source.json
+          source_gh release view "$TAG" -R "$SOURCE_REPO" --json assets -q "$listing" | sort > source-assets.tsv
+          names="$(cut -f1 source-assets.tsv)"
+
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            jq -r .body source.json > notes.md
+            gh release create "$TAG" --draft --title "$(jq -r .name source.json)" --notes-file notes.md
+          fi
+          uploaded="$(gh release view "$TAG" --json assets -q '.assets[] | select(.state == "uploaded") | .name')"
+          is_uploaded() { grep -qxF "$1" <<< "$uploaded"; }
+          in_source() { grep -qxF "$1" <<< "$names"; }
+
+          # One package and its checksum on disk at a time; the package is verified before upload.
+          while IFS= read -r name; do
+            if [[ "$name" == *.sha256 ]] && in_source "${name%.sha256}"; then
+              continue
+            fi
+            batch=("$name")
+            if in_source "$name.sha256"; then
+              batch+=("$name.sha256")
+            fi
+            pending=()
+            for file in "${batch[@]}"; do
+              is_uploaded "$file" || pending+=("$file")
+            done
+            if (( ${#pending[@]} == 0 )); then
+              echo "$name: already uploaded"
+              continue
+            fi
+            for file in "${batch[@]}"; do
+              source_gh release download "$TAG" -R "$SOURCE_REPO" -p "$file" --clobber
+            done
+            if (( ${#batch[@]} == 2 )); then
+              sha256sum -c "$name.sha256"
+            fi
+            gh release upload "$TAG" "${pending[@]}" --clobber
+            rm -f "${batch[@]}"
+          done <<< "$names"
+
+          gh release view "$TAG" --json assets -q "$listing" | sort > mirror-assets.tsv
+          if ! diff source-assets.tsv mirror-assets.tsv; then
+            echo "::error::The copy does not match $SOURCE_REPO $TAG, so the release stays a draft."
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false
+          echo "Published $(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"
