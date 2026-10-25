@@ -56,7 +56,7 @@ jobs:
           cd "$work"
 
           listing='.assets[] | "\(.name)\t\(.size)"'
-          source_gh release view "$TAG" -R "$SOURCE_REPO" --json name,body > source.json
+          source_gh release view "$TAG" -R "$SOURCE_REPO" --json name,body,isPrerelease > source.json
           source_gh release view "$TAG" -R "$SOURCE_REPO" --json assets -q "$listing" | sort > source-assets.tsv
           names="$(cut -f1 source-assets.tsv)"
 
@@ -64,8 +64,10 @@ jobs:
             jq -r .body source.json > notes.md
             gh release create "$TAG" --draft --title "$(jq -r .name source.json)" --notes-file notes.md
           fi
-          uploaded="$(gh release view "$TAG" --json assets -q '.assets[] | select(.state == "uploaded") | .name')"
-          is_uploaded() { grep -qxF "$1" <<< "$uploaded"; }
+          uploaded="$(gh release view "$TAG" --json assets -q '.assets[] | select(.state == "uploaded") | "\(.name)\t\(.size)"')"
+          # A copy counts only when its name and size both match the source; anything else is
+          # replaced, so a re-run repairs as well as resumes.
+          is_current() { grep -qxF "$(awk -F '\t' -v name="$1" '$1 == name' source-assets.tsv)" <<< "$uploaded"; }
           in_source() { grep -qxF "$1" <<< "$names"; }
 
           # One package and its checksum on disk at a time; the package is verified before upload.
@@ -79,7 +81,7 @@ jobs:
             fi
             pending=()
             for file in "${batch[@]}"; do
-              is_uploaded "$file" || pending+=("$file")
+              is_current "$file" || pending+=("$file")
             done
             if (( ${#pending[@]} == 0 )); then
               echo "$name: already uploaded"
@@ -97,8 +99,15 @@ jobs:
 
           gh release view "$TAG" --json assets -q "$listing" | sort > mirror-assets.tsv
           if ! diff source-assets.tsv mirror-assets.tsv; then
-            echo "::error::The copy does not match $SOURCE_REPO $TAG, so the release stays a draft."
+            echo "::error::The copy differs from $SOURCE_REPO $TAG, so it was not published."
             exit 1
           fi
-          gh release edit "$TAG" --draft=false
+          # Copy the source's flags. GitHub's default would mark any newly published release as
+          # Latest, even an older tag, and the landing page links to the latest release.
+          source_latest="$(source_gh api "repos/$SOURCE_REPO/releases/latest" -q .tag_name)"
+          latest=false
+          if [[ "$source_latest" == "$TAG" ]]; then
+            latest=true
+          fi
+          gh release edit "$TAG" --draft=false --latest="$latest" --prerelease="$(jq -r .isPrerelease source.json)"
           echo "Published $(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"
